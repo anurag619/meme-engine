@@ -677,23 +677,72 @@ def main() -> int:
 
     TMP_TRENDING_DIR.mkdir(parents=True, exist_ok=True)
     sent = 0
+    # Track which template ids we've already used in this run so the wildcard
+    # fallback doesn't accidentally pick a duplicate.
+    used_ids_in_run: set[str] = {
+        str(s["template"].get("id"))
+        for s in lineup if not s["wildcard"]
+    }
+    # Once OpenAI fails (e.g. billing hard limit), skip remaining wildcards
+    # for the rest of the run — no point hammering a 400 endpoint.
+    wildcard_disabled_for_run = False
+
     for i, slot in enumerate(lineup, 1):
         tpl = slot["template"]
         captions = slot["captions"]
         fmt = slot["format"]
         topic = slot["topic"]
 
-        if slot["wildcard"]:
+        png_bytes: bytes | None = None
+        if slot["wildcard"] and not wildcard_disabled_for_run:
             png_bytes, _ = render_openai_wildcard(topic=topic, captions=captions)
-        else:
+            if png_bytes is None:
+                wildcard_disabled_for_run = True
+
+        if png_bytes is None and slot["wildcard"]:
+            # Wildcard slot failed (or was pre-disabled) — fall back to an
+            # Imgflip template so today's lineup stays at TOP_N memes.
+            fallback_picks = pick_distinct_set(
+                topic=topic, templates=templates, count=1,
+            )
+            # Manually exclude ids we've already used this run.
+            fallback_picks = [
+                p for p in fallback_picks
+                if str(p[0].get("id")) not in used_ids_in_run
+            ]
+            if not fallback_picks:
+                # Brute-force: pick any unused trending template.
+                for cand in templates:
+                    if str(cand.get("id")) not in used_ids_in_run:
+                        fallback_picks = [(cand, get_format(cand))]
+                        break
+            if fallback_picks:
+                tpl, fmt = fallback_picks[0]
+                captions = captions_for(tpl, fmt)
+                slot["template"] = tpl
+                slot["format"] = fmt
+                slot["captions"] = captions
+                slot["wildcard"] = False
+                print(f"  ↩ slot #{i} fell back to Imgflip "
+                      f"(id={tpl.get('id')} {tpl.get('name')!r})")
+                png_bytes = render_via_imgflip(
+                    template_id=str(tpl["id"]),
+                    captions=captions,
+                    username=user,
+                    password=pwd,
+                )
+
+        if png_bytes is None and not slot["wildcard"]:
             png_bytes = render_via_imgflip(
                 template_id=str(tpl["id"]),
                 captions=captions,
                 username=user,
                 password=pwd,
             )
+
         if not png_bytes:
             continue
+        used_ids_in_run.add(str(tpl.get("id")))
 
         slug = re.sub(r"[^a-zA-Z0-9]+", "-",
                       (tpl.get("name") or "meme").lower()).strip("-")[:40]
