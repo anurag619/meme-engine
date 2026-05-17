@@ -109,6 +109,17 @@ CAPTION_POOLS: dict[str, list[tuple[str, ...]]] = {
         ("Hire developers", "Hire a co-pilot",
          "Hire an AI agent", "Become the AI agent"),
     ],
+    # Clown Applying Makeup (4-panel escalation)
+    "195515965": [
+        ("Ship the MVP", "Ship the rewrite",
+         "Ship the rewrite of the rewrite", "Pivot to AI agents"),
+        ("Read the error", "Google the error",
+         "Ask Claude about the error", "Close the terminal"),
+        ("Manual deploy", "CI/CD pipeline",
+         "GitOps with ArgoCD", "Push to main and pray"),
+        ("Unit tests", "Integration tests",
+         "End-to-end tests", "Testing in production"),
+    ],
     # This Is Fine
     "55311130": [
         ("Production database", "Migrations on Friday afternoon"),
@@ -152,6 +163,14 @@ CAPTION_POOLS: dict[str, list[tuple[str, ...]]] = {
     "155067746": [
         ("Promoted feature flag to default", "Customer churn"),
         ("Skipped writing tests for 'just one PR'", "Outage at 2am"),
+    ],
+    # Flex Tape (Phil Swift — top: problem, bottom: absurd fix)
+    "166969924": [
+        ("Prod is on fire", "Restart the pods and pray"),
+        ("CI has been red for 3 days", "Skip the tests"),
+        ("Customer found a critical bug", "Mark it as a feature"),
+        ("The AI is hallucinating", "Add 'please be accurate' to the prompt"),
+        ("Database migration failed", "Restore from the backup we definitely have"),
     ],
     # UNO Draw 25 Cards
     "217743513": [
@@ -430,8 +449,14 @@ def render_via_imgflip(
         "username": username,
         "password": password,
     }
-    for i, c in enumerate(captions):
-        payload[f"text{i}"] = c or ""
+    # Imgflip's text0/text1 only supports 2 boxes. For 3+ captions, use
+    # the boxes[] parameter so all panels get text.
+    if len(captions) <= 2:
+        for i, c in enumerate(captions):
+            payload[f"text{i}"] = c or ""
+    else:
+        for i, c in enumerate(captions):
+            payload[f"boxes[{i}][text]"] = c or ""
     try:
         resp = requests.post(IMGFLIP_CAPTION_URL, data=payload, timeout=30)
         resp.raise_for_status()

@@ -127,8 +127,14 @@ def caption_via_imgflip(
         "username": username,
         "password": password,
     }
-    for i, c in enumerate(captions):
-        payload[f"text{i}"] = c or ""
+    # Imgflip's text0/text1 only supports 2 boxes. For 3+ captions, use
+    # the boxes[] parameter so all panels get text.
+    if len(captions) <= 2:
+        for i, c in enumerate(captions):
+            payload[f"text{i}"] = c or ""
+    else:
+        for i, c in enumerate(captions):
+            payload[f"boxes[{i}][text]"] = c or ""
     resp = requests.post(IMGFLIP_CAPTION_URL, data=payload, timeout=timeout)
     resp.raise_for_status()
     body = resp.json()
