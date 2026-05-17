@@ -82,6 +82,30 @@ TEMPLATE_PREPROCESS: dict[str, dict[str, Any]] = {
 IMGFLIP_CAPTION_URL = "https://api.imgflip.com/caption_image"
 SECRETS_PATH = Path.home() / ".config" / "jarvis" / "secrets.env"
 
+# Imgflip serves captioned JPEGs at the template's native resolution, which
+# for popular formats (Flex Tape, Clown, Drake) is < 600px. Telegram's
+# sendPhoto pipeline then re-compresses, producing visible blocky JPEG
+# artefacts. Upscale to ~1200px on the shorter edge with LANCZOS so text
+# stays crisp and Telegram has no excuse to re-encode aggressively.
+MIN_DELIVERY_SIDE_PX = 1200
+
+
+def _upscale_for_delivery(image: Image.Image, min_side: int = MIN_DELIVERY_SIDE_PX) -> Image.Image:
+    """Return ``image`` upscaled so its shorter edge is at least ``min_side``.
+
+    No-op if already large enough. Uses LANCZOS resampling for clean text edges.
+    """
+    if image.mode not in ("RGB", "RGBA"):
+        image = image.convert("RGB")
+    w, h = image.size
+    short = min(w, h)
+    if short >= min_side:
+        return image
+    scale = min_side / float(short)
+    return image.resize(
+        (int(round(w * scale)), int(round(h * scale))), Image.LANCZOS
+    )
+
 
 def _load_secrets_env(path: Path = SECRETS_PATH) -> None:
     """Load KEY=VALUE pairs from ~/.config/jarvis/secrets.env into os.environ.
@@ -145,7 +169,7 @@ def caption_via_imgflip(
     img_url = body["data"]["url"]
     img_resp = requests.get(img_url, timeout=timeout)
     img_resp.raise_for_status()
-    return Image.open(BytesIO(img_resp.content))
+    return _upscale_for_delivery(Image.open(BytesIO(img_resp.content)))
 
 
 PLATFORM_SIZES: dict[str, tuple[int, int]] = {

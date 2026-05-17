@@ -437,6 +437,53 @@ def captions_for(
 # --------------------------------------------------------------------------- #
 # Imgflip rendering                                                           #
 # --------------------------------------------------------------------------- #
+# Minimum length (px) of the shorter image edge before we send to Telegram.
+# Imgflip returns captioned JPEGs at the template's native resolution, which
+# for many popular formats is < 600px. Telegram's sendPhoto pipeline then
+# re-compresses small images aggressively, producing the blocky JPEG artefacts
+# you see on the rendered output. Upscaling here with LANCZOS keeps caption
+# text sharp and prevents Telegram from re-encoding into oblivion.
+MIN_DELIVERY_SIDE_PX = 1200
+
+
+def _upscale_and_to_png(image_bytes: bytes, min_side: int = MIN_DELIVERY_SIDE_PX) -> bytes:
+    """Upscale a captioned image to ``min_side`` on its shorter edge and
+    re-encode as PNG.
+
+    Pure quality-of-delivery shim:
+      - Imgflip returns JPEG bytes. We were saving them with a ``.png``
+        extension which is a lie *and* invites Telegram to recompress again.
+      - LANCZOS upscale to ~1200px on the short edge gives Telegram enough
+        pixels that it won't aggressively re-encode for inline preview.
+      - Returning PNG bytes means a lossless wrapper from here on; further
+        edits won't lose more detail.
+
+    No-op (returns input unchanged) if PIL is unavailable for some reason —
+    we'd rather ship a small JPEG than crash the cron.
+    """
+    try:
+        from io import BytesIO as _BytesIO
+        from PIL import Image
+        im = Image.open(_BytesIO(image_bytes))
+        # Ensure RGB; some Imgflip variants come back as P / RGBA which
+        # then save as larger-than-needed PNGs.
+        if im.mode not in ("RGB", "RGBA"):
+            im = im.convert("RGB")
+        w, h = im.size
+        short = min(w, h)
+        if short < min_side:
+            scale = min_side / float(short)
+            new_size = (int(round(w * scale)), int(round(h * scale)))
+            im = im.resize(new_size, Image.LANCZOS)
+        buf = _BytesIO()
+        im.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+    except Exception as exc:  # noqa: BLE001 — never fail delivery over quality
+        print(f"  ! upscale/repng failed ({exc}); sending original bytes",
+              file=sys.stderr)
+        return image_bytes
+
+
 def render_via_imgflip(
     template_id: str,
     captions: list[str],
@@ -468,7 +515,7 @@ def render_via_imgflip(
         img_url = body["data"]["url"]
         img_resp = requests.get(img_url, timeout=30)
         img_resp.raise_for_status()
-        return img_resp.content
+        return _upscale_and_to_png(img_resp.content)
     except requests.RequestException as exc:
         print(f"  ! imgflip request error: {exc}", file=sys.stderr)
         return None
