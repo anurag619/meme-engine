@@ -484,6 +484,19 @@ def _upscale_and_to_png(image_bytes: bytes, min_side: int = MIN_DELIVERY_SIDE_PX
         return image_bytes
 
 
+# Pin typography across every render so the daily brief reads as one
+# coherent set rather than a collage of different fonts and sizes.
+# Imgflip's `font` param only accepts "impact" or "arial"; some templates
+# default to a per-template designer font (e.g., Clown Applying Makeup
+# falls back to a clean sans), which is what made today's brief look
+# inconsistent next to Impact-rendered templates like Flex Tape.
+# `max_font_size` is in pixels at Imgflip's native (un-upscaled) render
+# resolution. 36 keeps short captions from ballooning out of proportion;
+# longer captions still auto-shrink to fit their box.
+IMGFLIP_FONT = "impact"
+IMGFLIP_MAX_FONT_SIZE = "36"
+
+
 def render_via_imgflip(
     template_id: str,
     captions: list[str],
@@ -495,6 +508,10 @@ def render_via_imgflip(
         "template_id": template_id,
         "username": username,
         "password": password,
+        # Top-level font/size — applies when text0/text1 form is used.
+        # Harmless when boxes[] form is used (per-box values override).
+        "font": IMGFLIP_FONT,
+        "max_font_size": IMGFLIP_MAX_FONT_SIZE,
     }
     # Imgflip's text0/text1 only supports 2 boxes. For 3+ captions, use
     # the boxes[] parameter so all panels get text.
@@ -504,6 +521,8 @@ def render_via_imgflip(
     else:
         for i, c in enumerate(captions):
             payload[f"boxes[{i}][text]"] = c or ""
+            payload[f"boxes[{i}][font]"] = IMGFLIP_FONT
+            payload[f"boxes[{i}][max_font_size]"] = IMGFLIP_MAX_FONT_SIZE
     try:
         resp = requests.post(IMGFLIP_CAPTION_URL, data=payload, timeout=30)
         resp.raise_for_status()

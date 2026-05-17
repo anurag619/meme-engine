@@ -132,6 +132,13 @@ def _load_secrets_env(path: Path = SECRETS_PATH) -> None:
         pass
 
 
+# Typography pins — kept in sync with daily_trending.py so the CLI and the
+# daily brief produce visually identical output. Imgflip's `font` only takes
+# "impact" or "arial"; `max_font_size` is in pixels at native render res.
+IMGFLIP_FONT = "impact"
+IMGFLIP_MAX_FONT_SIZE = "36"
+
+
 def caption_via_imgflip(
     template_id: str,
     captions: list[str],
@@ -150,6 +157,10 @@ def caption_via_imgflip(
         "template_id": str(template_id),
         "username": username,
         "password": password,
+        # Force consistent typography across every render (see daily_trending
+        # for the rationale). Per-box overrides are set below when needed.
+        "font": IMGFLIP_FONT,
+        "max_font_size": IMGFLIP_MAX_FONT_SIZE,
     }
     # Imgflip's text0/text1 only supports 2 boxes. For 3+ captions, use
     # the boxes[] parameter so all panels get text.
@@ -159,6 +170,8 @@ def caption_via_imgflip(
     else:
         for i, c in enumerate(captions):
             payload[f"boxes[{i}][text]"] = c or ""
+            payload[f"boxes[{i}][font]"] = IMGFLIP_FONT
+            payload[f"boxes[{i}][max_font_size]"] = IMGFLIP_MAX_FONT_SIZE
     resp = requests.post(IMGFLIP_CAPTION_URL, data=payload, timeout=timeout)
     resp.raise_for_status()
     body = resp.json()
