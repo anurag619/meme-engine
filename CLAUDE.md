@@ -324,16 +324,27 @@ kept landing on the same 3 templates. Rules:
    `get_memes`, not the top 3-5.
 2. **7-day cooldown** — `history.json` blocks any template id used within
    the past 7 days. Inside a single run, the 5 picks also dedupe each other.
-3. **Joke-first** — caption pool is chosen *before* the template:
+   **Only the daily cron records uses** — manual / on-demand renders should
+   pass `on_demand=True` to `history.record_use` so they don't pollute the
+   cooldown view. The flag is a no-op short-circuit; nothing gets written.
+3. **LRU within fresh** — even after cooldown clears, the matcher picks the
+   **least-recently-used** template from the fresh bucket. Stops "iconic"
+   templates (Panik Kalm, Drake, Woman Yelling) from re-surfacing every 3–5
+   days when the format bucket is small. The LLM selector is also bounded
+   to the LRU half of fresh (`LRU_CANDIDATE_FRACTION = 0.5`,
+   `LRU_CANDIDATE_FLOOR = 3` in `template_matcher.py`), so even when the
+   LLM is biased toward famous formats it can only choose from the
+   long-unused end.
+4. **Joke-first** — caption pool is chosen *before* the template:
    `topic → format → caption → template`, not the reverse.
-4. **Format diversity within a batch** — `pick_distinct_set` prefers formats
+5. **Format diversity within a batch** — `pick_distinct_set` prefers formats
    not yet seen in the current batch, falling back to repeats only once all
    non-empty formats have been covered.
-5. **Web extras** — drop new viral formats into `web_templates.json` (id,
+6. **Web extras** — drop new viral formats into `web_templates.json` (id,
    name, url, format, box_count). Jarvis runs a weekly WebSearch ("new meme
    templates 2026" / "viral meme formats this month") and curates them by
    hand — Python doesn't fetch them itself.
-6. **OpenAI wildcards** — 15% of slots, when `OPENAI_API_KEY` is set, skip
+7. **OpenAI wildcards** — 15% of slots, when `OPENAI_API_KEY` is set, skip
    the template entirely. Tunable via `WILDCARD_PROBABILITY` in
    `daily_trending.py`.
 

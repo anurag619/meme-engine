@@ -74,6 +74,59 @@ def choose_format(
     return _least_used_format(pruned, recent_formats)
 
 
+# Within a "fresh" bucket (already past cooldown / within-batch dedup), we
+# always prefer the least-recently-used template — even when the LLM is
+# making the call. This stops "iconic" templates (Drake, This Is Fine,
+# Panik Kalm) from re-surfacing every 3-5 days when the LLM picker biases
+# toward famous formats. We compute an LRU-sorted slice of the bucket and
+# only that slice is presented to the LLM.
+#
+# LRU_CANDIDATE_FLOOR keeps the candidate pool from collapsing to one
+# template (which would defeat the LLM's purpose). LRU_CANDIDATE_FRACTION
+# is the share of the bucket we keep at the LRU end.
+LRU_CANDIDATE_FLOOR = 3
+LRU_CANDIDATE_FRACTION = 0.5
+
+
+def _lru_sorted(
+    candidates: list[dict[str, Any]],
+    *,
+    last_used: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """Sort ``candidates`` least-recently-used first, with random tie-break.
+
+    Templates never used are treated as ts=0 and float to the top. Random
+    tie-break stops the same template id from always winning when several
+    are never-used.
+    """
+    if last_used is None:
+        last_used = history.last_used_timestamps()
+    return sorted(
+        candidates,
+        key=lambda t: (last_used.get(str(t.get("id")), 0.0), random.random()),
+    )
+
+
+def _lru_candidate_pool(
+    fresh: list[dict[str, Any]],
+    *,
+    last_used: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """Return the LRU-end slice of ``fresh`` to present to the LLM picker.
+
+    Size = max(LRU_CANDIDATE_FLOOR, ⌈len(fresh) * LRU_CANDIDATE_FRACTION⌉)
+    capped at len(fresh).
+    """
+    if not fresh:
+        return []
+    ordered = _lru_sorted(fresh, last_used=last_used)
+    cap = max(
+        LRU_CANDIDATE_FLOOR,
+        -(-len(ordered) * 1 // 2),  # ceil-div for the fraction
+    )
+    return ordered[: min(cap, len(ordered))]
+
+
 def pick_template_via_llm(
     *,
     topic: str,
@@ -136,20 +189,26 @@ def pick_template(
 
     fresh = [t for t in bucket if str(t.get("id")) not in recent_ids]
     if fresh:
-        # LLM-judged pick within the already-filtered bucket. Falls through
-        # to random.choice on any failure — guardrails (cooldown / format)
-        # have already been applied above.
-        llm_pick = pick_template_via_llm(topic=topic, candidates=fresh)
+        # LRU-bounded LLM pick. We narrow ``fresh`` to its LRU half before
+        # showing it to the LLM, so even when the model has a bias toward
+        # iconic formats (Drake-shaped comparisons, etc.) it can only
+        # choose from templates we haven't used in a while. Falls through
+        # to the LRU template directly on any LLM failure.
+        last_used = history.last_used_timestamps()
+        candidate_pool = _lru_candidate_pool(fresh, last_used=last_used)
+        llm_pick = pick_template_via_llm(topic=topic, candidates=candidate_pool)
         if llm_pick is not None:
             return llm_pick, chosen_fmt
-        return random.choice(fresh), chosen_fmt
+        return candidate_pool[0], chosen_fmt
 
     # Bucket fully on cooldown — relax for this format only.
     if bucket:
         # Avoid the very-most-recent id at minimum.
         avoid = {str(i) for i in (exclude_ids or [])}
         relaxed = [t for t in bucket if str(t.get("id")) not in avoid] or bucket
-        return random.choice(relaxed), chosen_fmt
+        # Still prefer LRU even in the relaxed pool — this is the path
+        # taken when a small format bucket is fully on cooldown.
+        return _lru_sorted(relaxed)[0], chosen_fmt
 
     # Format had no templates at all — fall back to any non-cooldown template.
     fallback_pool = [
@@ -213,10 +272,14 @@ def pick_distinct_set(
                 break  # asked for more memes than we have templates
             chosen_fmt = get_format(fresh[0])
 
-        # LLM-judged pick within the already-filtered fresh pool. Falls
-        # through to random.choice on any failure.
-        llm_pick = pick_template_via_llm(topic=topic, candidates=fresh)
-        pick = llm_pick if llm_pick is not None else random.choice(fresh)
+        # LRU-bounded LLM pick — restricts the LLM's candidate pool to
+        # the least-recently-used slice of ``fresh`` so iconic templates
+        # don't keep re-surfacing every few days. Falls through to the
+        # LRU template directly on any LLM failure.
+        last_used = history.last_used_timestamps()
+        candidate_pool = _lru_candidate_pool(fresh, last_used=last_used)
+        llm_pick = pick_template_via_llm(topic=topic, candidates=candidate_pool)
+        pick = llm_pick if llm_pick is not None else candidate_pool[0]
         picks.append((pick, chosen_fmt))
         used_ids.add(str(pick.get("id")))
         used_formats.append(chosen_fmt)

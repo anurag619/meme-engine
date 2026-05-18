@@ -61,9 +61,18 @@ def record_use(
     fmt: str | None = None,
     topic: str = "",
     source: str = "imgflip",
+    on_demand: bool = False,
 ) -> None:
     """Append a usage record. Safe to call concurrently — last writer wins,
-    which is fine for our once-a-day cron."""
+    which is fine for our once-a-day cron.
+
+    ``on_demand=True`` is a no-op — callers who render memes outside the
+    cron (manual test runs, ad-hoc deliveries, the variety test) pass this
+    flag so their renders don't pollute the cooldown view. Only the daily
+    brief should record usage.
+    """
+    if on_demand:
+        return
     data = load()
     data["entries"].append({
         "date": date.today().isoformat(),
@@ -74,6 +83,29 @@ def record_use(
         "source": source,
     })
     save(data)
+
+
+def last_used_timestamps() -> dict[str, float]:
+    """Return ``{template_id: unix_ts}`` of the most-recent use per template.
+
+    Used by the matcher to pick the **least-recently-used** template from a
+    fresh bucket — even after the 7-day cooldown clears, we still prefer the
+    template we haven't touched in the longest time. Templates never used
+    are absent from the dict (callers should treat absence as ``0``).
+    """
+    data = load()
+    latest: dict[str, float] = {}
+    for e in data.get("entries", []):
+        tid = str(e.get("template_id") or "")
+        if not tid:
+            continue
+        try:
+            ts = float(e.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts > latest.get(tid, 0):
+            latest[tid] = ts
+    return latest
 
 
 def recently_used_ids(days: int = DEFAULT_COOLDOWN_DAYS) -> set[str]:
