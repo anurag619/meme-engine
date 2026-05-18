@@ -198,23 +198,42 @@ both current chatter and timeless beats.
 
 ### How `fetch_topics.py` works
 
-1. Hits **HN front page** via Algolia
-   (`https://hn.algolia.com/api/v1/search?tags=front_page`) — free, no auth,
-   single request, IP-friendly. Reddit is IP-blocked from this DO host and
-   Twitter API is paywalled, so HN is the only realistic free source.
-2. Pre-filters via `HEADLINE_BLOCKLIST` (skips Ask/Show HN, obituaries,
-   geopolitics).
-3. Hands the surviving headlines to `gpt-4o-mini` via
-   `llm_captions.distil_topics` (temperature 0.7, 8-word cap per topic,
-   snarky/observational voice).
-4. Writes `topics.json` with `{generated_at, source, headline_count, topics}`.
+Three sources run in sequence, each independently failure-tolerant:
+
+1. **Hacker News front page** (tech) — Algolia
+   (`https://hn.algolia.com/api/v1/search?tags=front_page`). Pre-filtered
+   via `HEADLINE_BLOCKLIST` (Ask/Show HN, obituaries, active conflicts).
+   Distilled via `llm_captions.distil_topics`.
+2. **Wikipedia Current Events Portal** (world) — pulls
+   `en.wikipedia.org/wiki/Portal:Current_events` via the parse API. HTML
+   is parsed by a small stdlib `HTMLParser` subclass; every `<li>` becomes
+   a candidate event line. Stricter `WORLD_BLOCKLIST` (wars, casualties,
+   named tragedies, suffering) pre-filters. Distilled via
+   `llm_captions.distil_world_topics` with tone guardrails.
+3. **OpenAI web search digest** (world) — one `web_search_preview` call
+   via the Responses API. The prompt explicitly asks for absurd /
+   culturally-significant / non-tragic stories. Output parsed line-by-line,
+   pre-filtered, distilled via `llm_captions.distil_world_topics`. Costs
+   ~$0.025/call.
+
+The three pools are merged (HN first → tech bias matches the brand),
+case-insensitive deduped, and written as a single flat `topics` list plus
+a `by_source` map.
+
+Reddit is not used (IP-blocked from this DO host). X/Twitter API is
+paywalled — see the May 2026 decision note.
 
 ### Safety / fallback
 
 - `OPENAI_API_KEY` missing → script exits 0 and leaves `topics.json`
   untouched. Daily brief falls back to static `DAILY_TOPICS` silently.
-- HN unreachable → script exits 1, leaves `topics.json` untouched. Same
-  fallback behaviour.
+- Any single source failing (HN unreachable, Wikipedia 5xx, web search
+  timeout) is logged and skipped — surviving sources still write their
+  share. The script exits 1 only if *every* source fails.
+- World items pass both `WORLD_BLOCKLIST` (keyword pre-filter) **and**
+  `distil_world_topics`'s tone-guardrail system prompt. The LLM is
+  instructed to return an empty list rather than ship a tasteless meme
+  topic — "better silence than a taste violation".
 - `topics.json` older than 14 days (`TOPICS_MAX_AGE_DAYS` in
   `daily_trending`) → ignored, static pool only.
 - Bad JSON in `topics.json` → ignored with stderr warning, static pool only.
@@ -222,15 +241,29 @@ both current chatter and timeless beats.
 ### Manual refresh
 
 ```bash
+# full refresh — all three sources
 ~/jarvis-workspace/meme-engine/.venv/bin/python -m src.fetch_topics
-# add --quiet for cron-style suppressed output
-# add --count 15 to bump the topic count
-# add --headlines 60 to feed more HN context to the model
+
+# tech-only (HN), skip world sources
+.venv/bin/python -m src.fetch_topics --skip-world
+
+# skip just the web search (save ~$0.025), keep Wikipedia
+.venv/bin/python -m src.fetch_topics --skip-websearch
+
+# debug — print raw source items before distillation
+.venv/bin/python -m src.fetch_topics --debug
+
+# tune counts per source
+.venv/bin/python -m src.fetch_topics --hn-topics 15 --wiki-topics 10
 ```
 
-### Cost
+### Cost (per weekly refresh)
 
-One LLM call per refresh, weekly. < **$0.001 / week**.
+- HN distillation: 1 gpt-4o-mini call (~$0.001)
+- Wikipedia distillation: 1 gpt-4o-mini call (~$0.001)
+- OpenAI web search: 1 `web_search_preview` call on gpt-4o (~$0.025)
+
+Total ~**$0.03 / week** ≈ **$0.12 / month**.
 
 ## LLM-powered captions & template selection (`src/llm_captions.py`)
 

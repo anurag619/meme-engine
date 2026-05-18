@@ -492,6 +492,153 @@ def distil_topics(
         return None
 
 
+def distil_world_topics(
+    items: list[str],
+    *,
+    count: int = 10,
+) -> list[str] | None:
+    """Distil mainstream-news / world-events items into meme topic phrases.
+
+    Distinct from ``distil_topics`` (which handles tech-news/HN). World
+    events carry tone risk — wars, casualties, named tragedies, and political
+    targeting don't meme well for a tech-founder audience. This function
+    bakes the guardrails into the system prompt and skips anything that only
+    works by punching down.
+
+    Returns ``None`` on any failure or if no items survive filtering.
+    """
+    if not items:
+        return None
+    client = _client()
+    if client is None:
+        return None
+    try:
+        system = (
+            "You convert world-news items into meme topic phrases for a "
+            "daily brief aimed at engineers, founders, and AI-curious "
+            "technologists.\n\n"
+            "STRICT TONE GUARDRAILS — SKIP HEADLINES ABOUT:\n"
+            "  - Active armed conflicts, war casualties, named war zones.\n"
+            "  - Specific tragedies with victims (shootings, plane crashes, "
+            "natural disasters with body counts).\n"
+            "  - Suffering people, refugees, hostages.\n"
+            "  - Targeting named individuals (politicians, public figures) "
+            "for mockery rather than the situation they're in.\n"
+            "  - Anything where the only available meme angle requires "
+            "mocking victims or suffering.\n\n"
+            "PREFER HEADLINES ABOUT:\n"
+            "  - Cultural absurdity (CEO blunders, viral mishaps, weird "
+            "trends, billionaire-shenanigans).\n"
+            "  - Tech-policy collisions (AI in elections, AI in court, "
+            "regulator chaos, antitrust drama).\n"
+            "  - Corporate clown shows (Boeing-style failures, bank "
+            "implosions, crypto rugs, tech IPO disasters).\n"
+            "  - Climate-tech vs reality, EV market drama.\n"
+            "  - Generational / workplace shifts visible in the news.\n\n"
+            "RULES:\n"
+            "  - Each topic phrase: 8 words or fewer.\n"
+            "  - Observational, dry, snarky — never cruel.\n"
+            "  - Topic is the *premise* (a situation a meme could riff on), "
+            "not the punchline.\n"
+            "  - Vary the angles. No repeats of the same story.\n"
+            "  - No hashtags, no emojis, no ALL CAPS.\n"
+            "  - If the entire input is unfit (war, casualties only), return "
+            "an empty list — better silence than a tasteless meme.\n\n"
+            "Good examples:\n"
+            "  - \"Boeing rediscovers physics again\"\n"
+            "  - \"AI lawyer cites cases that don't exist\"\n"
+            "  - \"Crypto founder claims he's the victim\"\n"
+            "  - \"Billionaire's space project hits second delay\"\n\n"
+            "Respond as a JSON object with key \"topics\" — a list of up to "
+            f"{count} meme topic phrase strings. No prose."
+        )
+        resp = client.chat.completions.create(
+            model=MODEL,
+            temperature=0.6,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Items to distil (recent world events / culture). "
+                        f"Produce up to {count} meme topic phrases — skip "
+                        f"anything that fails the tone guardrails:\n\n"
+                        + "\n".join(f"- {it}" for it in items)
+                    ),
+                },
+            ],
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        raw = resp.choices[0].message.content or ""
+        payload = json.loads(raw)
+        topics = payload.get("topics")
+        if not isinstance(topics, list):
+            return None
+        cleaned = [
+            str(t).strip().strip(".").strip()
+            for t in topics
+            if isinstance(t, (str, int, float)) and str(t).strip()
+        ]
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for t in cleaned:
+            key = t.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(t)
+        return deduped or None
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ! llm_captions.distil_world_topics failed ({exc})",
+              file=sys.stderr)
+        return None
+
+
+def openai_web_search(
+    query: str,
+    *,
+    model: str = "gpt-4o",
+    timeout: int | None = None,
+) -> str | None:
+    """Run an OpenAI ``web_search_preview`` query, return the synthesised answer.
+
+    Uses the Responses API (``client.responses.create``). The model browses,
+    summarises, and returns plain text. Returns ``None`` on any failure —
+    callers fall back to whatever non-search source they have.
+
+    Costs ~$0.025 per query at current pricing. Designed to be called rarely
+    (weekly cron), not on a hot path.
+    """
+    client = _client()
+    if client is None:
+        return None
+    try:
+        resp = client.responses.create(
+            model=model,
+            tools=[{"type": "web_search_preview"}],
+            input=query,
+            timeout=timeout or (REQUEST_TIMEOUT_SECONDS * 4),
+        )
+        # The Responses SDK exposes the final text answer at .output_text.
+        text = getattr(resp, "output_text", None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        # Fallback: scan resp.output for any text content.
+        output = getattr(resp, "output", None) or []
+        for item in output:
+            content = getattr(item, "content", None) or []
+            for piece in content:
+                t = getattr(piece, "text", None)
+                if isinstance(t, str) and t.strip():
+                    return t.strip()
+        return None
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ! llm_captions.openai_web_search failed ({exc})",
+              file=sys.stderr)
+        return None
+
+
 def select_template(
     topic: str,
     available_templates: list[dict[str, Any]],
