@@ -22,7 +22,7 @@ from .template_categories import (
     suggest_format,
     templates_by_format,
 )
-from . import history
+from . import history, llm_captions
 
 
 def _least_used_format(
@@ -74,6 +74,34 @@ def choose_format(
     return _least_used_format(pruned, recent_formats)
 
 
+def pick_template_via_llm(
+    *,
+    topic: str,
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Ask the LLM to pick the best template out of an already-filtered pool.
+
+    ``candidates`` MUST already be filtered for cooldown / within-batch dedup
+    by the caller — the LLM only judges fit. Returns the chosen template, or
+    ``None`` on any failure (no key, timeout, bad JSON, id not in pool).
+
+    Kept as a thin wrapper around ``llm_captions.select_template`` so the LLM
+    contract lives in one module.
+    """
+    if not candidates or not llm_captions.is_enabled():
+        return None
+    ids = llm_captions.select_template(
+        topic=topic,
+        available_templates=candidates,
+        count=1,
+        format_of=get_format,
+    )
+    if not ids:
+        return None
+    by_id = {str(t.get("id")): t for t in candidates}
+    return by_id.get(ids[0])
+
+
 def pick_template(
     *,
     topic: str,
@@ -108,6 +136,12 @@ def pick_template(
 
     fresh = [t for t in bucket if str(t.get("id")) not in recent_ids]
     if fresh:
+        # LLM-judged pick within the already-filtered bucket. Falls through
+        # to random.choice on any failure — guardrails (cooldown / format)
+        # have already been applied above.
+        llm_pick = pick_template_via_llm(topic=topic, candidates=fresh)
+        if llm_pick is not None:
+            return llm_pick, chosen_fmt
         return random.choice(fresh), chosen_fmt
 
     # Bucket fully on cooldown — relax for this format only.
@@ -179,7 +213,10 @@ def pick_distinct_set(
                 break  # asked for more memes than we have templates
             chosen_fmt = get_format(fresh[0])
 
-        pick = random.choice(fresh)
+        # LLM-judged pick within the already-filtered fresh pool. Falls
+        # through to random.choice on any failure.
+        llm_pick = pick_template_via_llm(topic=topic, candidates=fresh)
+        pick = llm_pick if llm_pick is not None else random.choice(fresh)
         picks.append((pick, chosen_fmt))
         used_ids.add(str(pick.get("id")))
         used_formats.append(chosen_fmt)

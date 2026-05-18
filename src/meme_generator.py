@@ -42,7 +42,8 @@ import requests
 from io import BytesIO
 from PIL import Image, ImageChops
 
-from . import fetch_trending
+from . import fetch_trending, llm_captions
+from .template_categories import get_format
 from .text_overlay import (
     TEMPLATE_REGIONS,
     draw_meme_panels,
@@ -528,9 +529,32 @@ def main() -> int:
     # Captions --------------------------------------------------------------- #
     top, bottom = args.top, args.bottom
     if not top and not bottom and args.auto_caption:
-        top, bottom = auto_caption(args.topic)
-        if not args.quiet:
-            print(f"[meme_generator] auto captions: {top!r} / {bottom!r}")
+        # LLM first when a topic is supplied and OPENAI_API_KEY is set.
+        # Static auto_caption() is the safety net — never crashes, never blank.
+        llm_captioned = False
+        if args.topic and llm_captions.is_enabled() and template is not None:
+            box_count = int(template.get("box_count") or 2)
+            llm_out = llm_captions.generate_captions(
+                template_name=str(template.get("name") or ""),
+                template_format=get_format(template),
+                box_count=box_count,
+                topic=args.topic,
+            )
+            if llm_out is not None:
+                # Map the first two captions onto top/bottom. Templates with
+                # box_count > 2 are routed through the panel renderer later,
+                # so any extras are stitched back via --top/--bottom only when
+                # the panel path isn't engaged. For the auto-caption CLI we
+                # always present top + bottom as the primary contract.
+                top = llm_out[0] if len(llm_out) > 0 else ""
+                bottom = llm_out[1] if len(llm_out) > 1 else ""
+                llm_captioned = True
+                if not args.quiet:
+                    print(f"[meme_generator] LLM captions: {top!r} / {bottom!r}")
+        if not llm_captioned:
+            top, bottom = auto_caption(args.topic)
+            if not args.quiet:
+                print(f"[meme_generator] auto captions: {top!r} / {bottom!r}")
     if not top and not bottom:
         print("No captions provided. Pass --top / --bottom (or --auto-caption).",
               file=sys.stderr)

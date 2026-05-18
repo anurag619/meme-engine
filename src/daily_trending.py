@@ -39,7 +39,7 @@ from typing import Any
 
 import requests
 
-from . import history, web_templates
+from . import history, llm_captions, web_templates
 from .template_categories import ALL_FORMATS, get_format
 from .template_matcher import pick_distinct_set
 
@@ -414,17 +414,37 @@ def captions_for(
     template: dict[str, Any],
     fmt: str,
     *,
+    topic: str = "",
     rng: random.Random | None = None,
+    use_llm: bool = True,
 ) -> list[str]:
     """Return a list of strings to feed text0..textN for this template.
 
     Resolution order:
+      0. LLM (``llm_captions.generate_captions``) — preferred when enabled and
+         a topic is supplied. Any LLM failure (no key, timeout, wrong count,
+         bad parse) silently falls through to the static pools below.
       1. Bespoke pool keyed by template id (CAPTION_POOLS).
       2. Format-level pool (FORMAT_JOKE_POOLS).
       3. Generic fallback.
+
+    ``use_llm`` lets the batch path skip the per-slot LLM call when the
+    batch-level call has already produced captions for this template.
     """
     rng = rng or random
     tid = str(template.get("id"))
+
+    if use_llm and topic and llm_captions.is_enabled():
+        box_count = int(template.get("box_count") or 2)
+        llm_out = llm_captions.generate_captions(
+            template_name=str(template.get("name") or ""),
+            template_format=fmt,
+            box_count=box_count,
+            topic=topic,
+        )
+        if llm_out is not None:
+            return llm_out
+
     pool = CAPTION_POOLS.get(tid)
     if pool:
         return list(rng.choice(pool))
@@ -671,6 +691,8 @@ def choose_daily_lineup(
         topic = sampled_topics[i] if i < len(sampled_topics) else "general"
         if i in wildcard_slots:
             fmt = rng.choice(list(ALL_FORMATS))
+            # Static fallback caption; batch LLM (below) may overwrite. Wildcards
+            # are 2-box by convention (top + bottom rendered locally).
             captions = list(rng.choice(
                 FORMAT_JOKE_POOLS.get(fmt, GENERIC_FALLBACKS)
             ))
@@ -680,6 +702,7 @@ def choose_daily_lineup(
                     "id": f"openai-{int(time.time() * 1000)}-{i}",
                     "name": "OpenAI Wildcard",
                     "is_wildcard": True,
+                    "box_count": 2,
                 },
                 "format": fmt,
                 "captions": captions,
@@ -690,7 +713,10 @@ def choose_daily_lineup(
             tpl, fmt = next(pick_iter)
         except StopIteration:
             break
-        captions = captions_for(tpl, fmt, rng=rng)
+        # Populate with static caption first — guarantees every slot has
+        # something even if the batch LLM call below fails. The batch step
+        # overwrites successful slots with LLM output.
+        captions = captions_for(tpl, fmt, topic=topic, rng=rng, use_llm=False)
         lineup.append({
             "topic": topic,
             "template": tpl,
@@ -698,7 +724,53 @@ def choose_daily_lineup(
             "captions": captions,
             "wildcard": False,
         })
+
+    # Batch LLM pass — one round-trip for the whole day's brief instead of
+    # five per-slot calls. Cheaper, faster, and lets the model see the full
+    # brief so it can vary the angle across slots. Any failure leaves the
+    # static captions in place.
+    _apply_batch_llm_captions(lineup)
     return lineup
+
+
+def _apply_batch_llm_captions(lineup: list[dict[str, Any]]) -> None:
+    """In-place enhancement: replace static captions with LLM output where possible.
+
+    Safety:
+      - No-op if LLM is disabled (missing key or openai SDK).
+      - On batch failure, leaves the entire lineup's static captions in place.
+      - Per-slot: if the LLM returns ``None`` for a slot, that slot keeps its
+        static caption.
+      - Per-slot fallback: if the *batch* succeeded but a specific slot was
+        ``None``, we make one per-slot LLM call before giving up.
+    """
+    if not lineup or not llm_captions.is_enabled():
+        return
+    slots = [
+        {
+            "template_name": s["template"].get("name", ""),
+            "format": s["format"],
+            "box_count": int(s["template"].get("box_count") or 2),
+            "topic": s["topic"],
+        }
+        for s in lineup
+    ]
+    batch = llm_captions.generate_batch_captions(slots)
+    if batch is None:
+        return
+    for i, captions in enumerate(batch):
+        if captions is None:
+            # Per-slot retry for the laggards. Cheap (1 call max per missing slot).
+            retry = llm_captions.generate_captions(
+                template_name=slots[i]["template_name"],
+                template_format=slots[i]["format"],
+                box_count=slots[i]["box_count"],
+                topic=slots[i]["topic"],
+            )
+            if retry is not None:
+                lineup[i]["captions"] = retry
+            continue
+        lineup[i]["captions"] = captions
 
 
 # --------------------------------------------------------------------------- #
@@ -809,7 +881,7 @@ def main() -> int:
                         break
             if fallback_picks:
                 tpl, fmt = fallback_picks[0]
-                captions = captions_for(tpl, fmt)
+                captions = captions_for(tpl, fmt, topic=topic)
                 slot["template"] = tpl
                 slot["format"] = fmt
                 slot["captions"] = captions

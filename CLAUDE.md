@@ -18,6 +18,7 @@ meme-engine/
     template_matcher.py   # joke-first selection + 7-day rotation
     history.py            # usage log (history.json) + cooldown
     web_templates.py      # extra templates from outside Imgflip
+    llm_captions.py       # gpt-4o-mini captions + template selection (with fallbacks)
   templates/              # cached template images (gitignored)
   fonts/                  # Anton-Regular.ttf (free Impact substitute)
   trending.json           # refreshed daily (gitignored, 100 templates)
@@ -126,8 +127,11 @@ The morning brief. Joke-first selection with template rotation:
    non-empty bucket").
 3. **Pick a template in that format** that hasn't been used in the last 7
    days (`template_matcher.pick_distinct_set` + `history.recently_used_ids`).
-4. **Pick captions** — bespoke pool keyed by template id (`CAPTION_POOLS`),
-   else format-level pool (`FORMAT_JOKE_POOLS`), else `GENERIC_FALLBACKS`.
+4. **Pick captions** — preferred path is **gpt-4o-mini** via
+   `llm_captions.generate_batch_captions` (one batch call per brief, see the
+   LLM section below). Static fallback chain on any failure: bespoke pool
+   keyed by template id (`CAPTION_POOLS`), then format-level
+   (`FORMAT_JOKE_POOLS`), then `GENERIC_FALLBACKS`.
 5. **15% wildcard slots** — when `OPENAI_API_KEY` is set, ~15% of slots skip
    the template entirely and generate a custom meme via OpenAI image gen +
    local Pillow text overlay.
@@ -167,6 +171,56 @@ Imgflip template id. Each entry is a list of caption tuples; one is picked
 at random per run. Aim for sharp, observational, tech-audience-specific
 jokes — not corporate humour.
 
+## LLM-powered captions & template selection (`src/llm_captions.py`)
+
+When `OPENAI_API_KEY` is set, the engine uses **gpt-4o-mini** to:
+
+1. **Generate captions** that fit the chosen template's joke format (passed
+   through few-shot examples per format + an 8-word cap per line).
+2. **Pick the best template** out of the post-cooldown, post-dedup eligible
+   pool — same rotation guardrails still apply, the LLM only judges fit.
+
+Architecture is **upgrade, not replace**:
+
+- Every call returns `None` (or empty list) on any failure — missing key,
+  timeout, bad JSON, wrong caption count. The existing static `CAPTION_POOLS`
+  / `FORMAT_JOKE_POOLS` / `GENERIC_FALLBACKS` and `random.choice` matcher are
+  the safety net.
+- Daily cron without `OPENAI_API_KEY` keeps working exactly as before — the
+  module short-circuits silently.
+- The `openai` SDK is a soft import; if it's not installed the rest of the
+  engine still runs.
+
+### Where the LLM is wired in
+
+| Code path | Function | LLM call |
+|---|---|---|
+| `daily_trending.choose_daily_lineup` | `_apply_batch_llm_captions` | **One** batch call for all 5 slots (cheaper, lets the model vary the angle across the brief). Per-slot retry for slots the batch missed. |
+| `daily_trending.captions_for` | `llm_captions.generate_captions` | Per-template fallback when batch isn't used (and direct callers like the wildcard fallback path). |
+| `template_matcher.pick_template` | `pick_template_via_llm` → `select_template` | After cooldown / format / dedup filtering, the LLM judges the *fresh* bucket. Falls through to `random.choice` on failure. |
+| `template_matcher.pick_distinct_set` | Same as above, per slot in the loop. |
+| `meme_generator.main` (`--auto-caption`) | `llm_captions.generate_captions` | When `--topic` is supplied, tries LLM before the basic `auto_caption()` joke template. |
+
+### Tuning knobs (in `src/llm_captions.py`)
+
+- `MODEL = "gpt-4o-mini"` — cheap, fast, good enough for meme captions.
+- `CAPTION_TEMPERATURE = 0.9` — we want jokes, not safety.
+- `SELECTION_TEMPERATURE = 0.4` — we want sound judgement.
+- `REQUEST_TIMEOUT_SECONDS = 30`.
+- `FORMAT_GUIDANCE` — per-format prompt guidance (comparison ↔ contrast, escalation ↔ ascending absurdity, etc.).
+- `FEW_SHOT_EXAMPLES` — 1-2 examples per format pulled from the existing `CAPTION_POOLS`.
+
+### Env requirements
+
+- `OPENAI_API_KEY` in `~/.config/jarvis/secrets.env` — **optional**. If
+  missing, the engine falls back to static pools and the heuristic matcher
+  silently. No log noise, no crash.
+
+### Cost ballpark
+
+Daily brief (5 memes) = 1 batch caption call + ~5 template-selection calls
++ optional per-slot retries. Total under **$0.005/day** on gpt-4o-mini.
+
 ## Variety / rotation rules
 
 The matcher exists because Imgflip trending barely moves and the old code
@@ -204,7 +258,7 @@ Asserts: 5 memes about the same topic land on 5 distinct templates spanning
 ## Roadmap
 
 - [ ] Reddit trending-topic scraper (`fetch_reddit_topics`) — currently a stub.
-- [ ] LLM-generated captions as a default rather than auto-caption fallback.
+- [x] LLM-generated captions as a default rather than auto-caption fallback. (gpt-4o-mini via `src/llm_captions.py`, with static pools as the safety net.)
 - [ ] Weekly auto-refresh of `web_templates.json` via Jarvis WebSearch.
 
 ## Template hygiene rules
