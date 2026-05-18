@@ -407,6 +407,91 @@ def _compact_template_line(t: dict[str, Any], fmt: str) -> str:
     return f"{t.get('id')} | {name} | {fmt} | boxes={t.get('box_count') or '?'}"
 
 
+def distil_topics(
+    headlines: list[str],
+    *,
+    count: int = 12,
+) -> list[str] | None:
+    """Distil a list of raw headlines into meme-able topic phrases.
+
+    Used by ``fetch_topics.py`` to convert this week's HN front page into the
+    daily brief's topic pool. Each topic phrase should be short (≤ 8 words),
+    observational, and aimed at engineers/founders — the same audience as
+    the static ``DAILY_TOPICS`` in ``daily_trending``.
+
+    Returns ``None`` on any failure (caller falls back to static topics).
+    """
+    if not headlines:
+        return None
+    client = _client()
+    if client is None:
+        return None
+    try:
+        system = (
+            "You convert raw tech-news headlines into meme topic phrases for "
+            "a daily brief aimed at engineers, founders, and AI-curious "
+            "technologists.\n\n"
+            "RULES:\n"
+            "  - Each topic phrase must be 8 words or fewer.\n"
+            "  - Observational, snarky, specific. No corporate-speak.\n"
+            "  - Topics are the *premise*, not the punchline — they describe "
+            "a situation a meme could riff on.\n"
+            "  - Vary the angles: don't return five phrasings of the same "
+            "story.\n"
+            "  - Skip non-tech stories. Skip pure product launches without a "
+            "joke angle. Skip headlines about politicians or celebrities.\n"
+            "  - No hashtags, no emojis, no ALL CAPS (the renderer handles "
+            "uppercase).\n\n"
+            "Examples of good topic phrases:\n"
+            "  - \"Cursor vs Windsurf vs Claude Code\"\n"
+            "  - \"agents that promise autonomy and need babysitting\"\n"
+            "  - \"Series A reset at half the valuation\"\n\n"
+            "Respond as a JSON object with key \"topics\" — a list of "
+            f"{count} topic phrase strings. No prose."
+        )
+        resp = client.chat.completions.create(
+            model=MODEL,
+            temperature=0.7,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Headlines to distil (this week's tech-news front "
+                        f"page). Produce {count} meme topic phrases:\n\n"
+                        + "\n".join(f"- {h}" for h in headlines)
+                    ),
+                },
+            ],
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        raw = resp.choices[0].message.content or ""
+        payload = json.loads(raw)
+        topics = payload.get("topics")
+        if not isinstance(topics, list):
+            return None
+        cleaned = [
+            str(t).strip().strip(".").strip()
+            for t in topics
+            if isinstance(t, (str, int, float)) and str(t).strip()
+        ]
+        # Dedupe (case-insensitive) while preserving order.
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for t in cleaned:
+            key = t.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(t)
+        return deduped or None
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ! llm_captions.distil_topics failed ({exc})",
+              file=sys.stderr)
+        return None
+
+
 def select_template(
     topic: str,
     available_templates: list[dict[str, Any]],

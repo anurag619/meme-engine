@@ -15,6 +15,7 @@ templates/*.webp
 trending.json
 history.json
 web_templates.json
+topics.json
 
 # Local-only tests (per-repo convention)
 tests/

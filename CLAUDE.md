@@ -11,6 +11,7 @@ meme-engine/
   requirements.txt
   src/
     fetch_trending.py     # refreshes trending.json + templates/ (top 100)
+    fetch_topics.py       # refreshes topics.json from HN front page (weekly)
     meme_generator.py     # CLI entry point
     text_overlay.py       # Pillow Impact-style text drawing
     daily_trending.py     # joke-first daily brief (5 memes/day)
@@ -24,6 +25,7 @@ meme-engine/
   trending.json           # refreshed daily (gitignored, 100 templates)
   history.json            # usage log for 7-day rotation (gitignored)
   web_templates.json      # web-sourced extras (gitignored)
+  topics.json             # weekly HN-distilled topic phrases (gitignored)
   tests/                  # local-only test scripts (gitignored)
   tmp/                    # generated memes (gitignored)
 ```
@@ -99,29 +101,38 @@ Caption rules — Jarvis writes these, not the script:
 
 ## Cron
 
-Two daily jobs, both UTC:
+Three jobs, all UTC:
 
 ```
-# 03:25 UTC — refresh the Imgflip trending cache
+# Mondays 03:20 UTC — refresh HN-distilled topic pool (weekly)
+20 3 * * 1 /home/jarvis/jarvis-workspace/meme-engine/.venv/bin/python \
+  -m src.fetch_topics \
+  --quiet >> /home/jarvis/jarvis-workspace/logs/meme-engine-cron.log 2>&1
+
+# Daily 03:25 UTC — refresh the Imgflip trending cache
 25 3 * * * /home/jarvis/jarvis-workspace/meme-engine/.venv/bin/python \
   /home/jarvis/jarvis-workspace/meme-engine/src/fetch_trending.py \
   --quiet >> /home/jarvis/jarvis-workspace/logs/meme-engine-cron.log 2>&1
 
-# 03:30 UTC (= 09:00 IST) — send the daily trending memes brief to Telegram
+# Daily 03:30 UTC (= 09:00 IST) — send the daily trending memes brief to Telegram
 30 3 * * * /home/jarvis/jarvis-workspace/meme-engine/.venv/bin/python \
   /home/jarvis/jarvis-workspace/meme-engine/src/daily_trending.py \
   >> /home/jarvis/jarvis-workspace/logs/meme-trending-cron.log 2>&1
 ```
 
-Order matters: the refresh runs 5 minutes before the brief so the brief always
-uses fresh data. Logs land in `~/jarvis-workspace/logs/meme-engine-cron.log`
-and `meme-trending-cron.log` respectively.
+Order matters within the daily 03:2x..03:30 window: topics refresh first
+(Mondays only), then trending templates, then the brief. Logs land in
+`~/jarvis-workspace/logs/meme-engine-cron.log` and `meme-trending-cron.log`
+respectively.
 
 ## daily_trending.py
 
 The morning brief. Joke-first selection with template rotation:
 
-1. **Pick a topic** per slot from `DAILY_TOPICS`.
+1. **Pick a topic** per slot from the merged topic pool — fresh HN-distilled
+   topics from `topics.json` (refreshed weekly via `fetch_topics.py`) layered
+   on top of the static evergreen `DAILY_TOPICS`. Falls back to the static
+   pool alone when `topics.json` is missing, stale (> 14 days), or malformed.
 2. **Pick a joke format** for that topic (`template_categories.suggest_format`
    — keyword heuristic; falls back to "least-recently-used format with a
    non-empty bucket").
@@ -170,6 +181,56 @@ keeping cron silent.
 Imgflip template id. Each entry is a list of caption tuples; one is picked
 at random per run. Aim for sharp, observational, tech-audience-specific
 jokes — not corporate humour.
+
+## Topic pool — static + HN-distilled (`fetch_topics.py`)
+
+The daily brief riffs on a *topic* per slot. Two layers feed the pool:
+
+1. **`DAILY_TOPICS`** in `daily_trending.py` — the evergreen pool. Timeless
+   engineer / founder beats (e.g. "shipping on Friday", "Series A reset at
+   half the valuation"). Anchors the brand voice.
+2. **`topics.json`** — fresh HN-distilled phrases refreshed weekly by
+   `src/fetch_topics.py`. Captures *this week's* tech chatter.
+
+At lineup time, `daily_trending.load_topics()` merges fresh + static
+(fresh-first, case-insensitive dedupe, order preserved) so the brief gets
+both current chatter and timeless beats.
+
+### How `fetch_topics.py` works
+
+1. Hits **HN front page** via Algolia
+   (`https://hn.algolia.com/api/v1/search?tags=front_page`) — free, no auth,
+   single request, IP-friendly. Reddit is IP-blocked from this DO host and
+   Twitter API is paywalled, so HN is the only realistic free source.
+2. Pre-filters via `HEADLINE_BLOCKLIST` (skips Ask/Show HN, obituaries,
+   geopolitics).
+3. Hands the surviving headlines to `gpt-4o-mini` via
+   `llm_captions.distil_topics` (temperature 0.7, 8-word cap per topic,
+   snarky/observational voice).
+4. Writes `topics.json` with `{generated_at, source, headline_count, topics}`.
+
+### Safety / fallback
+
+- `OPENAI_API_KEY` missing → script exits 0 and leaves `topics.json`
+  untouched. Daily brief falls back to static `DAILY_TOPICS` silently.
+- HN unreachable → script exits 1, leaves `topics.json` untouched. Same
+  fallback behaviour.
+- `topics.json` older than 14 days (`TOPICS_MAX_AGE_DAYS` in
+  `daily_trending`) → ignored, static pool only.
+- Bad JSON in `topics.json` → ignored with stderr warning, static pool only.
+
+### Manual refresh
+
+```bash
+~/jarvis-workspace/meme-engine/.venv/bin/python -m src.fetch_topics
+# add --quiet for cron-style suppressed output
+# add --count 15 to bump the topic count
+# add --headlines 60 to feed more HN context to the model
+```
+
+### Cost
+
+One LLM call per refresh, weekly. < **$0.001 / week**.
 
 ## LLM-powered captions & template selection (`src/llm_captions.py`)
 

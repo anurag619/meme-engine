@@ -45,8 +45,14 @@ from .template_matcher import pick_distinct_set
 
 ROOT = Path(__file__).resolve().parent.parent
 TRENDING_JSON = ROOT / "trending.json"
+TOPICS_JSON = ROOT / "topics.json"
 TMP_TRENDING_DIR = ROOT / "tmp" / "trending"
 SECRETS_PATH = Path.home() / ".config" / "jarvis" / "secrets.env"
+
+# How many days before topics.json is considered stale and we fall back to
+# the static DAILY_TOPICS only. Refresh cron runs weekly, so 14 gives one
+# missed run of slack before we revert to evergreens.
+TOPICS_MAX_AGE_DAYS = 14
 
 TOP_N = 5
 TELEGRAM_CHAT_ID = "5757660658"
@@ -56,9 +62,14 @@ IMGFLIP_CAPTION_URL = "https://api.imgflip.com/caption_image"
 # image. Set to 0 to disable wildcards. Honoured only when OPENAI_API_KEY is set.
 WILDCARD_PROBABILITY = 0.15
 
-# Default topic mix that the daily brief riffs on. Sampled per slot so
-# captions feel like a varied scroll, not five jokes about the same thing.
+# Static topic pool — used when topics.json (fresh, from fetch_topics.py)
+# isn't present or is stale. Sampled per slot so captions feel like a
+# varied scroll, not five jokes about the same thing.
+#
+# Add timeless engineer / founder beats here. ``fetch_topics.py`` layers
+# this-week's HN-driven topics on top — both pools are merged at runtime.
 DAILY_TOPICS: tuple[str, ...] = (
+    # Classic evergreen
     "AI replacing developers",
     "founders pretending to have product-market fit",
     "engineers vs LLM hallucinations",
@@ -69,6 +80,27 @@ DAILY_TOPICS: tuple[str, ...] = (
     "vibe-coding straight to production",
     "indie hackers vs VCs",
     "standups eating the morning",
+    # 2026-current additions
+    "Cursor vs Windsurf vs Claude Code",
+    "MCP servers for absolutely everything",
+    "agents that promise autonomy and need babysitting",
+    "RAG vs the 2M context window",
+    "the Devin demo that quietly stopped",
+    "GPU waitlists and the H200 black market",
+    "open-weights vs proprietary forever war",
+    "tokens-per-second as a personality trait",
+    "the Anthropic vs OpenAI hiring poach loop",
+    "AI girlfriends raising rounds",
+    "evals you wrote vs benchmarks you cite",
+    "rewrite-the-monolith-in-Rust energy",
+    "the AI doomer at every standup",
+    "TypeScript devs pretending Bun is production",
+    "engineering org reshuffle every 6 months",
+    "vibe-coding with three model tabs open",
+    "fine-tuning vs just adding to the system prompt",
+    "the React Server Components migration that never ends",
+    "Series A reset at half the valuation",
+    "the prompt that worked yesterday",
 )
 
 
@@ -405,6 +437,46 @@ def load_trending() -> list[dict[str, Any]]:
     data = json.loads(TRENDING_JSON.read_text())
     imgflip = data.get("templates", [])
     return web_templates.merge_with_imgflip(imgflip)
+
+
+def load_topics() -> tuple[str, ...]:
+    """Merge fresh HN-distilled topics with the static evergreen pool.
+
+    Returns the static ``DAILY_TOPICS`` alone when ``topics.json`` is
+    missing, stale (> ``TOPICS_MAX_AGE_DAYS`` days), or malformed. When
+    fresh, the two pools are interleaved and deduped (case-insensitive)
+    so the brief gets both current chatter and timeless beats.
+    """
+    if not TOPICS_JSON.exists():
+        return DAILY_TOPICS
+    try:
+        data = json.loads(TOPICS_JSON.read_text())
+        generated_at = float(data.get("generated_at") or 0)
+        topics = data.get("topics") or []
+        if not isinstance(topics, list) or not topics:
+            return DAILY_TOPICS
+        age_days = (time.time() - generated_at) / 86400.0
+        if age_days > TOPICS_MAX_AGE_DAYS:
+            print(f"[daily_trending] topics.json is {age_days:.0f} days old "
+                  f"(> {TOPICS_MAX_AGE_DAYS}); using static pool only.",
+                  file=sys.stderr)
+            return DAILY_TOPICS
+        fresh = [str(t).strip() for t in topics if str(t).strip()]
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"[daily_trending] failed to load topics.json ({exc}); "
+              f"using static pool.", file=sys.stderr)
+        return DAILY_TOPICS
+
+    # Merge fresh + static, dedupe case-insensitively, preserve order.
+    seen: set[str] = set()
+    merged: list[str] = []
+    for t in list(fresh) + list(DAILY_TOPICS):
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(t)
+    return tuple(merged)
 
 
 # --------------------------------------------------------------------------- #
@@ -824,7 +896,17 @@ def main() -> int:
     if not templates:
         return 1
 
-    lineup = choose_daily_lineup(templates, count=TOP_N)
+    topic_pool = load_topics()
+    fresh_count = max(0, len(topic_pool) - len(DAILY_TOPICS))
+    if fresh_count:
+        print(f"[daily_trending] topic pool: {len(topic_pool)} "
+              f"({fresh_count} fresh from topics.json + "
+              f"{len(DAILY_TOPICS)} evergreen)")
+    else:
+        print(f"[daily_trending] topic pool: {len(topic_pool)} evergreen "
+              f"(no topics.json — run src.fetch_topics to refresh)")
+
+    lineup = choose_daily_lineup(templates, count=TOP_N, topics=topic_pool)
     print(f"[daily_trending] picked {len(lineup)} memes from "
           f"{len(templates)} templates ...")
     for i, slot in enumerate(lineup, 1):
